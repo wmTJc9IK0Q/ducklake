@@ -533,6 +533,33 @@ DuckLakeCopyOptions DuckLakeInsert::GetCopyOptions(ClientContext &context, DuckL
 	if (catalog.TryGetConfigOption("per_thread_output", per_thread_output_str, schema_id, table_id)) {
 		per_thread_output = per_thread_output_str == "true";
 	}
+
+	// VARIANT shredding schema supplied by the caller (e.g. computed at flush time). Encoded as
+	// newline-delimited "column=typestring" entries, mapped to the parquet writer's SHREDDING option so an
+	// explicit schema is applied while STREAMING - no whole-dataset buffering / auto-analysis (which cannot
+	// bound memory on a large flush). Per-table scope lets each table (and, for per-partition tables like
+	// metrics, each per-partition-value write) carry only the schema relevant to it.
+	string shredding_spec;
+	if (catalog.TryGetConfigOption("parquet_shredding", shredding_spec, schema_id, table_id) &&
+	    !shredding_spec.empty()) {
+		child_list_t<Value> shredding_fields;
+		idx_t line_start = 0;
+		while (line_start < shredding_spec.size()) {
+			auto nl = shredding_spec.find('\n', line_start);
+			auto line = shredding_spec.substr(line_start, nl == string::npos ? string::npos : nl - line_start);
+			line_start = nl == string::npos ? shredding_spec.size() : nl + 1;
+			auto eq = line.find('=');
+			if (eq == string::npos) {
+				continue;
+			}
+			shredding_fields.emplace_back(line.substr(0, eq), Value(line.substr(eq + 1)));
+		}
+		if (!shredding_fields.empty()) {
+			vector<Value> shredding_input;
+			shredding_input.push_back(Value::STRUCT(std::move(shredding_fields)));
+			info->options["shredding"] = std::move(shredding_input);
+		}
+	}
 	idx_t target_file_size = catalog.GetTargetFileSize(context, schema_id, table_id);
 
 	// Always use native parquet geometry for writing
