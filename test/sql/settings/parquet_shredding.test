@@ -1,0 +1,67 @@
+# name: test/sql/settings/parquet_shredding.test
+# description: Test the parquet_shredding option (explicit, streaming VARIANT shredding schema)
+# group: [settings]
+
+require ducklake
+
+require parquet
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/ducklake_parquet_shredding.db' AS ducklake (DATA_PATH '{TEST_DIR}/ducklake_parquet_shredding', DATA_INLINING_ROW_LIMIT 0)
+
+# An explicit shredding schema restricts shredding to the listed keys: v.akey is shredded into a
+# typed column, while v.bkey (absent from the schema) stays in the untyped overlay. Auto-analysis
+# would shred BOTH keys, so this proves the explicit schema is authoritative and applied at write
+# time while streaming (no whole-dataset buffering).
+statement ok
+CALL ducklake.set_option('parquet_shredding', 'v=STRUCT("akey" VARCHAR)')
+
+statement ok
+CREATE TABLE ducklake.explicit AS SELECT {'akey': 'a' || i, 'bkey': 'b' || i}::VARIANT AS v FROM range(2000) t(i)
+
+# akey (listed) is shredded into a typed column ...
+query I
+SELECT count(*) > 0 FROM parquet_metadata('{TEST_DIR}/ducklake_parquet_shredding/**') WHERE file_name LIKE '%/explicit/%' AND path_in_schema LIKE 'v, typed_value, akey,%'
+----
+true
+
+# ... while bkey (not listed) is not shredded
+query I
+SELECT count(*) FROM parquet_metadata('{TEST_DIR}/ducklake_parquet_shredding/**') WHERE file_name LIKE '%/explicit/%' AND path_in_schema LIKE 'v, typed_value, bkey,%'
+----
+0
+
+# Clearing the schema restores auto-analysis: both keys are shredded again.
+statement ok
+CALL ducklake.set_option('parquet_shredding', '')
+
+statement ok
+CREATE TABLE ducklake.auto AS SELECT {'akey': 'a' || i, 'bkey': 'b' || i}::VARIANT AS v FROM range(2000) t(i)
+
+query I
+SELECT count(*) > 0 FROM parquet_metadata('{TEST_DIR}/ducklake_parquet_shredding/**') WHERE file_name LIKE '%/auto/%' AND path_in_schema LIKE 'v, typed_value, bkey,%'
+----
+true
+
+# The schema is stored per-catalog and survives a detach/attach cycle.
+statement ok
+CALL ducklake.set_option('parquet_shredding', 'v=STRUCT("akey" VARCHAR)')
+
+statement ok
+DETACH ducklake
+
+statement ok
+ATTACH 'ducklake:{TEST_DIR}/ducklake_parquet_shredding.db' AS ducklake (DATA_PATH '{TEST_DIR}/ducklake_parquet_shredding', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE ducklake.persisted AS SELECT {'akey': 'a' || i, 'bkey': 'b' || i}::VARIANT AS v FROM range(2000) t(i)
+
+query I
+SELECT count(*) > 0 FROM parquet_metadata('{TEST_DIR}/ducklake_parquet_shredding/**') WHERE file_name LIKE '%/persisted/%' AND path_in_schema LIKE 'v, typed_value, akey,%'
+----
+true
+
+query I
+SELECT count(*) FROM parquet_metadata('{TEST_DIR}/ducklake_parquet_shredding/**') WHERE file_name LIKE '%/persisted/%' AND path_in_schema LIKE 'v, typed_value, bkey,%'
+----
+0
