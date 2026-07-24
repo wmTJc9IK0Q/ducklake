@@ -19,6 +19,8 @@ static constexpr DuckLakeOptionMetadata DUCKLAKE_OPTIONS[] = {
     {"parquet_compression_level", "Compression level for Parquet files"},
     {"parquet_row_group_size", "Number of rows per row group in Parquet files"},
     {"parquet_row_group_size_bytes", "Number of bytes per row group in Parquet files"},
+    {"parquet_shredding", "VARIANT shredding schema, newline-delimited \"column=typestring\" entries, applied "
+                          "to the parquet writer's SHREDDING option at write time"},
     {"hive_file_pattern", "If partitioned data should be written in a hive-like folder structure"},
     {"target_file_size", "The target data file size for insertion and compaction operations"},
     {"version", "DuckLake format version"},

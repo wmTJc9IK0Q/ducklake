@@ -162,6 +162,10 @@ static unique_ptr<FunctionData> DuckLakeSetOptionBind(ClientContext &context, Ta
 		value = val.CastAs(context, LogicalType::BOOLEAN).GetValue<bool>() ? "true" : "false";
 	} else if (option == "sort_on_insert") {
 		value = val.CastAs(context, LogicalType::BOOLEAN).GetValue<bool>() ? "true" : "false";
+	} else if (option == "parquet_shredding") {
+		// VARIANT shredding schema, newline-delimited "column=typestring" entries. Passed through to the
+		// parquet writer's SHREDDING option at write time (see DuckLakeInsert::GetCopyOptions).
+		value = val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>();
 	} else {
 		throw NotImplementedException("Unsupported option %s", option);
 	}
