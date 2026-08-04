@@ -1,0 +1,127 @@
+# name: test/sql/merge/merge_partition_shredded.test
+# description: MERGE into a partitioned DuckLake table with explicit VARIANT shredding
+# group: [merge]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}/merge_partition_shredded
+
+statement ok
+ATTACH '{TEST_DIR}/head.duckdb' AS head
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE head.metric_numeric_series_wal (
+    series_id BIGINT,
+    metric_name VARCHAR,
+    metric_type VARCHAR,
+    unit VARCHAR,
+    description VARCHAR,
+    agg_temporality VARCHAR,
+    is_monotonic BOOLEAN,
+    resource_attributes VARIANT,
+    scope_name VARCHAR,
+    scope_version VARCHAR,
+    scope_attributes VARIANT,
+    attributes VARIANT,
+    min_timestamp TIMESTAMP,
+    max_timestamp TIMESTAMP
+)
+
+statement ok
+CREATE TABLE ducklake.metric_series_lake (
+    series_id BIGINT NOT NULL,
+    metric_name VARCHAR NOT NULL,
+    metric_type VARCHAR NOT NULL,
+    unit VARCHAR,
+    description VARCHAR,
+    agg_temporality VARCHAR,
+    is_monotonic BOOLEAN,
+    resource_attributes VARIANT,
+    scope_name VARCHAR,
+    scope_version VARCHAR,
+    scope_attributes VARIANT,
+    attributes VARIANT,
+    min_timestamp TIMESTAMP NOT NULL,
+    max_timestamp TIMESTAMP NOT NULL
+)
+
+statement ok
+ALTER TABLE ducklake.metric_series_lake SET PARTITIONED BY (metric_name)
+
+# Keep one explicit field so that the output layout is observable without
+# relying on auto-analysis.
+statement ok
+CALL ducklake.set_option('parquet_shredding', 'attributes=STRUCT("host.name" VARCHAR)')
+
+statement ok
+INSERT INTO head.metric_numeric_series_wal
+SELECT i,
+       'metric_' || (i % 10),
+       'gauge',
+       NULL,
+       NULL,
+       'cumulative',
+       false,
+       {'service.name':'svc'}::VARIANT,
+       'scope',
+       '1',
+       {'scope.name':'scope'}::VARIANT,
+       {'host.name':'host','other':'other'}::VARIANT,
+       '2025-01-01'::TIMESTAMP + i * INTERVAL '1 minute',
+       '2025-01-01'::TIMESTAMP + i * INTERVAL '2 minute'
+FROM range(100) t(i)
+
+# Run this test with a hard harness timeout. On the affected upstream build
+# this MERGE wedges in duckdb_execute_pending instead of completing.
+statement ok
+MERGE INTO ducklake.metric_series_lake AS t
+USING head.metric_numeric_series_wal AS s ON t.series_id = s.series_id
+WHEN MATCHED THEN UPDATE SET
+    min_timestamp = least(t.min_timestamp, s.min_timestamp),
+    max_timestamp = greatest(t.max_timestamp, s.max_timestamp)
+WHEN NOT MATCHED THEN INSERT VALUES (
+    s.series_id, s.metric_name, s.metric_type, s.unit, s.description,
+    s.agg_temporality, s.is_monotonic, s.resource_attributes,
+    s.scope_name, s.scope_version, s.scope_attributes, s.attributes,
+    s.min_timestamp, s.max_timestamp)
+
+query I
+SELECT count(*) FROM ducklake.metric_series_lake
+----
+100
+
+query I
+SELECT count(*) > 0
+FROM parquet_metadata('{DATA_PATH}/**/*.parquet')
+WHERE path_in_schema LIKE 'attributes, typed_value, host.name,%'
+----
+true
+
+# Exercise the MATCHED branch over the same partitioned files.
+statement ok
+UPDATE head.metric_numeric_series_wal
+SET max_timestamp = max_timestamp + INTERVAL '1 hour'
+
+statement ok
+MERGE INTO ducklake.metric_series_lake AS t
+USING head.metric_numeric_series_wal AS s ON t.series_id = s.series_id
+WHEN MATCHED THEN UPDATE SET
+    min_timestamp = least(t.min_timestamp, s.min_timestamp),
+    max_timestamp = greatest(t.max_timestamp, s.max_timestamp)
+WHEN NOT MATCHED THEN INSERT VALUES (
+    s.series_id, s.metric_name, s.metric_type, s.unit, s.description,
+    s.agg_temporality, s.is_monotonic, s.resource_attributes,
+    s.scope_name, s.scope_version, s.scope_attributes, s.attributes,
+    s.min_timestamp, s.max_timestamp)
+
+query II
+SELECT count(*), count(DISTINCT series_id) FROM ducklake.metric_series_lake
+----
+100	100
