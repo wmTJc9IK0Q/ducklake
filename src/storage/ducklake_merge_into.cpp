@@ -18,6 +18,7 @@
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/parallel/event.hpp"
+#include "duckdb/execution/executor.hpp"
 
 namespace duckdb {
 
@@ -242,13 +243,29 @@ static SinkFinalizeType FinalizeCopyToInsert(Pipeline &pipeline, Event &event, C
 		captured_event->Schedule();
 
 		// Work on tasks until the event is finished
+		auto &executor = pipeline.executor;
+		auto &scheduler = TaskScheduler::GetScheduler(context);
+		auto &token = executor.GetToken();
 		shared_ptr<Task> task;
-		auto &token = pipeline.executor.GetToken();
 		while (!captured_event->IsFinished()) {
-			if (TaskScheduler::GetScheduler(context).GetTaskFromProducer(token, task)) {
-				task->Execute(TaskExecutionMode::PROCESS_ALL);
-				task.reset();
+			if (executor.HasError()) {
+				// a task of this event threw - it will never report as finished, so stop waiting here
+				// instead of spinning forever and let the error surface
+				executor.ThrowException();
 			}
+			if (!scheduler.GetTaskFromProducer(token, task)) {
+				continue;
+			}
+			auto result = task->Execute(TaskExecutionMode::PROCESS_ALL);
+			while (result == TaskExecutionResult::TASK_NOT_FINISHED) {
+				// PROCESS_ALL should run a task to completion, but never drop one that asks for more
+				result = task->Execute(TaskExecutionMode::PROCESS_ALL);
+			}
+			if (result == TaskExecutionResult::TASK_BLOCKED) {
+				// the task parked itself - hand it to whoever unblocks it, rather than dropping it
+				task->Deschedule();
+			}
+			task.reset();
 		}
 	}
 
