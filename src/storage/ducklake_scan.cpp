@@ -107,6 +107,25 @@ unique_ptr<BaseStatistics> DuckLakeStatistics(ClientContext &context, const Func
 	return table.GetStatistics(context, column_index);
 }
 
+//! A pushed-down extract rewrites a projection slot to hold one of the column's children, and every reader the
+//! scan uses then has to deliver that child. DuckLakeInlinedDataReader cannot: it addresses its columns by a
+//! flat index into the inlined chunk and has no way to express a path, so it would emit the parent value into a
+//! slot the plan has already narrowed - wrong rows, silently, with no error to notice. Decline the pushdown for
+//! any scan that can reach inlined rows and let the ordinary extract run above the scan instead.
+static bool DuckLakeSupportsPushdownExtract(const FunctionData &bind_data_p, const LogicalIndex &col_idx) {
+	auto &bind_data = bind_data_p.Cast<MultiFileBindData>();
+	auto &column_type = bind_data.columns[col_idx.index].type;
+	if (column_type.id() != LogicalTypeId::STRUCT && column_type.id() != LogicalTypeId::VARIANT) {
+		return false;
+	}
+	auto &file_list = bind_data.file_list->Cast<DuckLakeMultiFileList>();
+	if (file_list.HasTransactionLocalData()) {
+		//! Transaction-local rows are served straight out of the write buffer, by the same reader
+		return false;
+	}
+	return file_list.GetTable().GetInlinedDataTables().empty();
+}
+
 unique_ptr<BaseStatistics> DuckLakeStatisticsExtended(ClientContext &context, TableFunctionGetStatisticsInput &input) {
 	auto &column_index = input.column_index;
 	if (column_index.IsVirtualColumn()) {
@@ -256,6 +275,7 @@ TableFunction DuckLakeFunctions::GetDuckLakeScanFunction(DatabaseInstance &insta
 	// 'statistics' callback around for callers that only know that interface does not have to cost us the
 	// struct/variant extract pushdown that the underlying parquet scan supports.
 	function.statistics_pushdown_extract = true;
+	function.supports_pushdown_extract = DuckLakeSupportsPushdownExtract;
 	function.get_bind_info = DuckLakeBindInfo;
 	function.get_virtual_columns = DuckLakeVirtualColumns;
 	function.get_row_id_columns = DuckLakeGetRowIdColumn;
