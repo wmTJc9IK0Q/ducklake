@@ -40,9 +40,16 @@ DuckLakeMultiFileList::DuckLakeMultiFileList(DuckLakeFunctionInfo &read_info,
 	inlined_data_tables.push_back(inlined_table);
 }
 
-void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, column_t column_id,
+void DuckLakeMultiFileList::AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, const ColumnIndex &column_index_p,
                                                     unique_ptr<TableFilter> filter) const {
+	auto column_id = column_index_p.GetPrimaryIndex();
 	if (IsVirtualColumn(column_id)) {
+		return;
+	}
+	if (column_index_p.IsPushdownExtract()) {
+		// The filter belongs to a child of this column, not to the column itself. Our pushdown info is keyed by
+		// the root field id and the expression filter below is built against the root column's type, so
+		// registering it here would test the child's predicate against the parent's per-file statistics.
 		return;
 	}
 	auto column_index = PhysicalIndex(column_id);
@@ -68,9 +75,11 @@ DuckLakeMultiFileList::DynamicFilterPushdown(ClientContext &context, const Multi
 	auto pushdown_info = make_uniq<FilterPushdownInfo>();
 
 	for (auto &entry : filters) {
-		auto column_id = column_ids[entry.GetIndex().GetIndex()];
+		// A flat column_t cannot carry an extract path, and the caller withholds extract filters from this
+		// interface for exactly that reason, so this index always denotes the whole column.
+		ColumnIndex column_index(column_ids[entry.GetIndex().GetIndex()]);
 		AddFilterToPushdownInfo(
-		    *pushdown_info, column_id,
+		    *pushdown_info, column_index,
 		    ExpressionFilter::GetExpressionFilter(entry.Filter(), "DuckLakeMultiFileList::DynamicFilterPushdown")
 		        .Copy());
 	}
@@ -106,8 +115,8 @@ unique_ptr<MultiFileList> DuckLakeMultiFileList::ComplexFilterPushdown(ClientCon
 	auto pushdown_info = filter_info ? filter_info->Copy() : make_uniq<FilterPushdownInfo>();
 
 	for (auto &entry : table_filter_set) {
-		auto column_id = info.column_ids[entry.GetIndex().GetIndex()];
-		AddFilterToPushdownInfo(*pushdown_info, column_id, entry.TakeFilter());
+		auto &column_index = info.column_indexes[entry.GetIndex().GetIndex()];
+		AddFilterToPushdownInfo(*pushdown_info, column_index, entry.TakeFilter());
 	}
 
 	if (pushdown_info->column_filters.empty()) {

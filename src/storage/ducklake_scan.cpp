@@ -108,10 +108,18 @@ unique_ptr<BaseStatistics> DuckLakeStatistics(ClientContext &context, const Func
 }
 
 unique_ptr<BaseStatistics> DuckLakeStatisticsExtended(ClientContext &context, TableFunctionGetStatisticsInput &input) {
-	if (input.column_index.IsVirtualColumn()) {
+	auto &column_index = input.column_index;
+	if (column_index.IsVirtualColumn()) {
 		return nullptr;
 	}
-	return DuckLakeStatistics(context, input.bind_data.get(), input.column_index.GetPrimaryIndex());
+	auto result = DuckLakeStatistics(context, input.bind_data.get(), column_index.GetPrimaryIndex());
+	if (!result || !column_index.IsPushdownExtract()) {
+		return result;
+	}
+	// The extract replaced this projection slot with one of the column's children, so the catalog statistics for
+	// the parent have to be narrowed to that child before they are attributed to the slot.
+	auto storage_index = StorageIndex::FromColumnIndex(column_index);
+	return result->PushdownExtract(storage_index.GetChildIndexes()[0]);
 }
 
 BindInfo DuckLakeBindInfo(const optional_ptr<FunctionData> bind_data) {
@@ -244,6 +252,10 @@ TableFunction DuckLakeFunctions::GetDuckLakeScanFunction(DatabaseInstance &insta
 
 	function.statistics = DuckLakeStatistics;
 	function.statistics_extended = DuckLakeStatisticsExtended;
+	// DuckLakeStatisticsExtended narrows the parent's statistics to the extracted child, so keeping the legacy
+	// 'statistics' callback around for callers that only know that interface does not have to cost us the
+	// struct/variant extract pushdown that the underlying parquet scan supports.
+	function.statistics_pushdown_extract = true;
 	function.get_bind_info = DuckLakeBindInfo;
 	function.get_virtual_columns = DuckLakeVirtualColumns;
 	function.get_row_id_columns = DuckLakeGetRowIdColumn;

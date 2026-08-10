@@ -1,0 +1,80 @@
+# name: test/sql/types/variant_extract_pushdown.test
+# description: Pushing a struct extract into the scan must not change answers
+# group: [types]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS db (DATA_PATH '{DATA_PATH}/extract_pushdown', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+USE db
+
+statement ok
+CREATE TABLE t AS
+SELECT i AS id, {'k': 'v' || (i % 4), 'n': i}::VARIANT AS v
+FROM range(400) t(i)
+
+# The scan carries its own 'statistics' callback, which cannot describe an
+# extracted child - it is only handed the column's primary index. Pushing an
+# extract in anyway would attribute the parent's statistics to the child.
+query II
+EXPLAIN SELECT count(*) FROM t WHERE v.k::VARCHAR = 'v2'
+----
+physical_plan	<REGEX>:.*v\.k.*
+
+query I
+SELECT count(*) FROM t WHERE v.k::VARCHAR = 'v2'
+----
+100
+
+query I
+SELECT count(*) FROM t WHERE v.k::VARCHAR = 'nope'
+----
+0
+
+query I
+SELECT count(*) FROM t WHERE v.n::INTEGER BETWEEN 100 AND 199
+----
+100
+
+query II
+SELECT v.k::VARCHAR, count(*) FROM t GROUP BY 1 ORDER BY 1
+----
+v0	100
+v1	100
+v2	100
+v3	100
+
+# A field that is not in the data at all. Every row's extract is NULL, so IS NULL
+# must match all of them. Filter pushdown identifies a filter's column by a flat
+# index that cannot carry the extract path, so a child's predicate handed to it
+# would be tested against the PARENT's statistics - and the parent has no NULLs,
+# which prunes every file and silently answers 0.
+query I
+SELECT count(*) FROM t WHERE v.absent::VARCHAR IS NULL
+----
+400
+
+query I
+SELECT count(*) FROM t WHERE v.absent::VARCHAR IS NOT NULL
+----
+0
+
+# Same predicates behind a barrier the extract cannot be pushed through, as an
+# oracle: the pushed-down and the non-pushed-down answers must agree.
+query I
+SELECT count(*) FROM (SELECT v.absent::VARCHAR AS a FROM t OFFSET 0) WHERE a IS NULL
+----
+400
+
+query I
+SELECT count(*) FROM (SELECT v.k::VARCHAR AS k FROM t OFFSET 0) WHERE k = 'v2'
+----
+100
