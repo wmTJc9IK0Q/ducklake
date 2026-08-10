@@ -1393,10 +1393,8 @@ void DuckLakeTransaction::FlushChanges() {
 }
 
 void DuckLakeTransaction::ApplyServerSideCommit(idx_t schema_version) {
-	if (snapshot) {
-		for (auto &entry : state->dropped_file_stats) {
-			ducklake_catalog.InvalidateTableStatsCache(snapshot->next_file_id, entry.first);
-		}
+	if (snapshot && !state->dropped_file_stats.empty()) {
+		ducklake_catalog.InvalidateGlobalStatsCache(snapshot->schema_version, snapshot->next_file_id);
 	}
 	catalog_version = schema_version;
 	if (connection) {
@@ -1536,8 +1534,8 @@ void DuckLakeTransaction::RunCommitLoop(DuckLakeSnapshot transaction_snapshot,
 	context.set_committed_snapshot_id = [&](idx_t snapshot_id) {
 		ducklake_catalog.SetCommittedSnapshotId(snapshot_id);
 	};
-	context.invalidate_table_stats_cache = [&](idx_t next_file_id, TableIndex table_id) {
-		ducklake_catalog.InvalidateTableStatsCache(next_file_id, table_id);
+	context.invalidate_global_stats_cache = [&](idx_t schema_version, idx_t next_file_id) {
+		ducklake_catalog.InvalidateGlobalStatsCache(schema_version, next_file_id);
 	};
 	context.commit_info = state->commit_info;
 	context.supports_v1_1_metadata = ducklake_catalog.SupportsRowGroupCount();

@@ -1,0 +1,79 @@
+# name: test/sql/stats/stats_cache_invalidation.test
+# description: Cached table statistics must not outlive the data they describe
+# group: [stats]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/stats_cache_invalidation')
+
+statement ok
+CREATE TABLE ducklake.t AS SELECT i AS id FROM range(1000) t(i);
+
+# Put an entry in the statistics cache, and record what it is worth: the row count
+# the planner derives comes from the cached statistics, so it is the observable that
+# tells stale statistics from fresh ones.
+query II
+EXPLAIN SELECT * FROM ducklake.t
+----
+physical_plan	<REGEX>:.*~1,000 rows.*
+
+statement ok
+INSERT INTO ducklake.t SELECT i AS id FROM range(1000, 1000000) t(i);
+
+# A thousand-fold more data has been committed since the entry was made. Statistics
+# that survive the commit leave the planner sizing this scan for the table as it was,
+# which is how a cache with no invalidation shows up: not as a wrong answer, but as a
+# plan built for data that is no longer there.
+query II
+EXPLAIN SELECT * FROM ducklake.t
+----
+physical_plan	<REGEX>:.*~1,000,000 rows.*
+
+# Row visibility must hold too. It does not depend on these statistics - the rows a
+# scan returns come from the file list, not from the catalog's statistics - so this
+# passes even with invalidation disabled. It is here to pin that down rather than to
+# leave it assumed, because "the cache cannot hide data" is the property that makes
+# caching statistics safe at all.
+query I
+SELECT count(*) FROM ducklake.t WHERE id >= 999000
+----
+1000
+
+statement ok
+CREATE TABLE ducklake.u AS SELECT i AS id FROM range(1000) t(i);
+
+statement ok con_reader
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS lake_r (DATA_PATH '{DATA_PATH}/stats_cache_invalidation')
+
+statement ok con_writer
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS lake_w (DATA_PATH '{DATA_PATH}/stats_cache_invalidation')
+
+query I con_reader
+SELECT count(*) FROM lake_r.u WHERE id >= 9000
+----
+0
+
+statement ok con_writer
+INSERT INTO lake_w.u SELECT i AS id FROM range(9000, 9042) t(i);
+
+query I con_reader
+SELECT count(*) FROM lake_r.u WHERE id >= 9000
+----
+42
+
+# A commit that only deletes still moves the generation counter, so the statistics
+# cached before it must not be reused either.
+statement ok
+DELETE FROM ducklake.t WHERE id < 999000
+
+query I
+SELECT count(*) FROM ducklake.t
+----
+1000

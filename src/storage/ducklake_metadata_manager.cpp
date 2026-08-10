@@ -1102,11 +1102,10 @@ vector<DuckLakeGlobalStatsInfo> TransformGlobalStats(QueryResult &result) {
 }
 
 string DuckLakeMetadataManager::GlobalTableStatsQuery() {
-	// Pure all-tables template (only {METADATA_CATALOG} is substituted by the caller; it is NOT run
-	// through StringUtil::Format). It must NOT contain a printf placeholder such as `WHERE table_id =
-	// %llu` - the server-side commit path (DuckLakeServerSideCommit::ReadExistingTableStats) executes
-	// the returned SQL verbatim, so a stray %llu would reach the parser and fail every server-side
-	// commit. The single-table GetGlobalTableStats() below keeps its own StringUtil::Format query.
+	// Only {METADATA_CATALOG} is substituted, and it is NOT run through StringUtil::Format: the
+	// server-side commit path (DuckLakeServerSideCommit::ReadExistingTableStats) executes the
+	// returned SQL verbatim, so a stray printf placeholder such as `WHERE table_id = %llu` would
+	// reach the parser and fail every server-side commit.
 	return R"(
 SELECT table_id, column_id, record_count, next_row_id, file_size_bytes, contains_null, contains_nan, min_value, max_value, extra_stats
 FROM {METADATA_CATALOG}.ducklake_table_stats
@@ -1121,20 +1120,11 @@ vector<DuckLakeGlobalStatsInfo> DuckLakeMetadataManager::ParseGlobalTableStats(Q
 	return TransformGlobalStats(result);
 }
 
-vector<DuckLakeGlobalStatsInfo> DuckLakeMetadataManager::GetGlobalTableStats(DuckLakeSnapshot snapshot,
-                                                                             TableIndex table_id) {
-	string query = StringUtil::Format(R"(
-SELECT table_id, column_id, record_count, next_row_id, file_size_bytes, contains_null, contains_nan, min_value, max_value, extra_stats
-FROM {METADATA_CATALOG}.ducklake_table_stats
-LEFT JOIN {METADATA_CATALOG}.ducklake_table_column_stats USING (table_id)
-WHERE table_id = %llu
-  AND record_count IS NOT NULL
-  AND file_size_bytes IS NOT NULL
-ORDER BY table_id;
-)",
-	                                  table_id.index);
-
-	auto result = Query(snapshot, query);
+vector<DuckLakeGlobalStatsInfo> DuckLakeMetadataManager::GetGlobalTableStats(DuckLakeSnapshot snapshot) {
+	// Deliberately unfiltered. Restricting to one table saves nothing measurable - the statistics
+	// tables hold one row per table and per column, so both variants are a small scan - while the
+	// caller needs most tables anyway and can cache them together.
+	auto result = Query(snapshot, GlobalTableStatsQuery());
 	return TransformGlobalStats(*result);
 }
 
@@ -5168,15 +5158,6 @@ void DuckLakeMetadataManager::DeleteSnapshots(const vector<DuckLakeSnapshotInfo>
 		snapshot_ids += to_string(snapshot.id);
 	}
 
-	vector<TableIndex> stats_table_ids;
-	result = Query("SELECT DISTINCT table_id FROM {METADATA_CATALOG}.ducklake_table_stats;");
-	if (result->HasError()) {
-		result->GetErrorObject().Throw("Failed to list table stats for cache invalidation in DuckLake: ");
-	}
-	for (auto &row : *result) {
-		stats_table_ids.push_back(TableIndex(row.GetValue<idx_t>(0)));
-	}
-
 	vector<string> tables_to_delete_from {"ducklake_snapshot", "ducklake_snapshot_changes"};
 	for (auto &delete_tbl : tables_to_delete_from) {
 		result = Execute(StringUtil::Format(R"(
@@ -5459,10 +5440,10 @@ WHERE NOT EXISTS (
 		}
 	}
 
+	// Expiring a snapshot can drop the files a table's statistics were derived from, so the cached
+	// statistics of every generation these snapshots span have to go.
 	for (auto &snapshot : snapshots) {
-		for (auto &table_id : stats_table_ids) {
-			catalog.InvalidateTableStatsCache(snapshot.next_file_id, table_id);
-		}
+		catalog.InvalidateGlobalStatsCache(snapshot.schema_version, snapshot.next_file_id);
 	}
 }
 

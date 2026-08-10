@@ -1953,8 +1953,9 @@ void DuckLakeTransactionState::Commit(DuckLakeSnapshot transaction_snapshot,
 			bool flushed_inlined = !flushed_inlined_tables.empty();
 			context.flush_cache_if_pending();
 			context.commit_connection();
-			for (auto &entry : dropped_file_stats) {
-				context.invalidate_table_stats_cache(commit_snapshot.next_file_id, entry.first);
+			if (!dropped_file_stats.empty()) {
+				context.invalidate_global_stats_cache(commit_snapshot.schema_version,
+				                                      commit_snapshot.next_file_id);
 			}
 			if (flushed_inlined && !context.skip_drop_empty_inlined) {
 				DropEmptySupersededInlinedTables(context);

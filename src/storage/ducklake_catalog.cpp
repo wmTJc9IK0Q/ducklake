@@ -156,9 +156,12 @@ idx_t EstimateCatalogSetMemory(const DuckLakeCatalogSet &catalog_set) {
 
 } // namespace
 
-optional_idx DuckLakeTableStatsCacheEntry::GetEstimatedCacheMemory() const {
-	idx_t estimate = sizeof(DuckLakeTableStats);
-	estimate += stats.column_stats.size() * ESTIMATED_BYTES_PER_COLUMN_STATS;
+optional_idx DuckLakeGlobalStatsCacheEntry::GetEstimatedCacheMemory() const {
+	idx_t estimate = 0;
+	for (auto &entry : table_stats) {
+		estimate += sizeof(DuckLakeTableStats);
+		estimate += entry.second->column_stats.size() * ESTIMATED_BYTES_PER_COLUMN_STATS;
+	}
 	return estimate;
 }
 
@@ -807,36 +810,40 @@ shared_ptr<DuckLakeTableStats> DuckLakeCatalog::GetTableStats(DuckLakeTransactio
 	return GetTableStats(transaction, transaction.GetSnapshot(), table_id);
 }
 
-shared_ptr<DuckLakeTableStats> DuckLakeCatalog::GetTableStats(DuckLakeTransaction &transaction,
-                                                              DuckLakeSnapshot snapshot, TableIndex table_id) {
+shared_ptr<DuckLakeGlobalStatsCacheEntry> DuckLakeCatalog::GetGlobalStats(DuckLakeTransaction &transaction,
+                                                                          DuckLakeSnapshot snapshot) {
 	auto &cache = GetObjectCacheInstance();
-	auto key = StatsCacheKey(snapshot.next_file_id, table_id);
-	auto cached = cache.Get<DuckLakeTableStatsCacheEntry>(key);
+	auto key = StatsCacheKey(snapshot.schema_version, snapshot.next_file_id);
+	auto cached = cache.Get<DuckLakeGlobalStatsCacheEntry>(key);
 	if (cached) {
-		auto *raw = cached.get();
-		return shared_ptr<DuckLakeTableStats>(std::move(cached), &raw->stats);
+		return cached;
 	}
 
-	// Load from the metadata manager
+	// Read every table's statistics in one round trip. The planner asks for statistics one table
+	// at a time, but it asks for most of them while planning a single statement, so fetching them
+	// per table turns one metadata query into as many as the statement has tables.
 	auto schema_entry = GetSchemaCacheEntry(transaction, snapshot);
-	auto global_stats = transaction.GetMetadataManager().GetGlobalTableStats(snapshot, table_id);
+	auto global_stats = transaction.GetMetadataManager().GetGlobalTableStats(snapshot);
 	auto lake_stats = ConstructStatsMap(global_stats, schema_entry->catalog_set);
 
-	unique_ptr<DuckLakeTableStats> table_stats;
-	auto it = lake_stats->table_stats.find(table_id);
-	if (it != lake_stats->table_stats.end()) {
-		table_stats = std::move(it->second);
+	auto entry = make_shared_ptr<DuckLakeGlobalStatsCacheEntry>();
+	for (auto &table_entry : lake_stats->table_stats) {
+		entry->table_stats.emplace(table_entry.first.index, shared_ptr<DuckLakeTableStats>(std::move(table_entry.second)));
 	}
+	cache.Put(std::move(key), entry);
+	return entry;
+}
 
-	if (!table_stats) {
-		// Table had no stats row for this snapshot (or did not exist at the snapshot)
+shared_ptr<DuckLakeTableStats> DuckLakeCatalog::GetTableStats(DuckLakeTransaction &transaction,
+                                                              DuckLakeSnapshot snapshot, TableIndex table_id) {
+	auto stats = GetGlobalStats(transaction, snapshot);
+	auto entry = stats->table_stats.find(table_id.index);
+	if (entry == stats->table_stats.end()) {
+		// The table has no statistics row at this generation, which the cached entry records as
+		// absence - so this costs nothing to answer again until the generation moves on.
 		return nullptr;
 	}
-
-	auto entry = make_shared_ptr<DuckLakeTableStatsCacheEntry>(std::move(*table_stats));
-	cache.Put(std::move(key), entry);
-	auto *raw = entry.get();
-	return shared_ptr<DuckLakeTableStats>(std::move(entry), &raw->stats);
+	return entry->second;
 }
 
 optional_ptr<SchemaCatalogEntry> DuckLakeCatalog::LookupSchema(CatalogTransaction transaction,
@@ -1103,17 +1110,23 @@ void DuckLakeCatalog::CacheSchemaVersionBeginSnapshot(TableIndex table_id, idx_t
 	schema_version_begin_snapshots[make_pair(table_id.index, schema_version)] = begin_snapshot;
 }
 
-string DuckLakeCatalog::StatsCacheKey(idx_t next_file_id, TableIndex table_id) const {
-	return StringUtil::Format("ducklake:%s:%s:%s:stats:%llu:table:%llu", GetName(), MetadataPath(), instance_id,
-	                          next_file_id, table_id.index);
+//! Statistics are valid for one data generation read through one schema version. `next_file_id`
+//! advances on every commit that changes data - every data file, every delete file and, when a
+//! commit only touches inlined data and writes no file at all, an explicit increment for exactly
+//! this purpose (DuckLakeTransactionState::GetNewDataFiles). `schema_version` advances on every
+//! DDL commit, which is what decides the column types the stored statistics are interpreted as.
+//! Anything that can change the answer therefore changes the key.
+string DuckLakeCatalog::StatsCacheKey(idx_t schema_version, idx_t next_file_id) const {
+	return StringUtil::Format("ducklake:%s:%s:%s:stats:%llu:%llu", GetName(), MetadataPath(), instance_id,
+	                          schema_version, next_file_id);
 }
 
 string DuckLakeCatalog::SchemaCacheKey(idx_t schema_version) const {
 	return StringUtil::Format("ducklake:%s:%s:%s:schema:%llu", GetName(), MetadataPath(), instance_id, schema_version);
 }
 
-void DuckLakeCatalog::InvalidateTableStatsCache(idx_t next_file_id, TableIndex table_id) {
-	GetObjectCacheInstance().Delete(StatsCacheKey(next_file_id, table_id));
+void DuckLakeCatalog::InvalidateGlobalStatsCache(idx_t schema_version, idx_t next_file_id) {
+	GetObjectCacheInstance().Delete(StatsCacheKey(schema_version, next_file_id));
 }
 
 void DuckLakeCatalog::InvalidateSchemaCache(idx_t schema_version) {

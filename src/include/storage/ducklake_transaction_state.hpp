@@ -98,8 +98,8 @@ struct DuckLakeCommitContext {
 	std::function<void(idx_t)> set_catalog_version;
 	//! Records the committed snapshot id on the catalog.
 	std::function<void(idx_t)> set_committed_snapshot_id;
-	//! Invalidates the cached stats entry for a table after a stats-affecting file drop.
-	std::function<void(idx_t, TableIndex)> invalidate_table_stats_cache = [](idx_t, TableIndex) {
+	//! Invalidates the cached statistics of every table at a generation, after a stats-affecting file drop.
+	std::function<void(idx_t, idx_t)> invalidate_global_stats_cache = [](idx_t, idx_t) {
 	};
 	//! Author / message / extra info for the snapshot row.
 	DuckLakeSnapshotCommit commit_info;
