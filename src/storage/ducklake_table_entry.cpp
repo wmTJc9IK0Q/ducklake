@@ -352,7 +352,7 @@ unique_ptr<FunctionData> DuckLakeFunctions::BindDuckLakeScan(ClientContext &cont
 	TableFunctionBindInput bind_input(inputs, param_map, return_types, input_table_names, nullptr, nullptr, function,
 	                                  empty_ref);
 
-	vector<string> bind_names;
+	vector<Identifier> bind_names;
 	return function.bind(context, bind_input, return_types, bind_names);
 }
 

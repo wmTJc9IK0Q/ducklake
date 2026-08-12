@@ -115,7 +115,7 @@ public:
 	const string &MetadataDatabaseName() const {
 		return options.metadata_database;
 	}
-	const string &MetadataSchemaName() const {
+	const Identifier &MetadataSchemaName() const {
 		return options.metadata_schema;
 	}
 	const string &MetadataPath() const {

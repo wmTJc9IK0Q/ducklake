@@ -35,7 +35,7 @@ struct DuckLakeAddDataFilesData : public TableFunctionData {
 };
 
 static unique_ptr<FunctionData> DuckLakeAddDataFilesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]);
 	string schema_name;
 	if (input.inputs[1].IsNull()) {

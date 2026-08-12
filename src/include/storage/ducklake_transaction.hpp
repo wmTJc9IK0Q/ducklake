@@ -276,7 +276,7 @@ public:
 
 	void SetCommitMessage(const DuckLakeSnapshotCommit &option);
 
-	string GetDefaultSchemaName();
+	Identifier GetDefaultSchemaName();
 
 	bool HasLocalDeletes(TableIndex table_id) const;
 	bool HasLocalDeleteForFile(TableIndex table_id, const string &path) const;
