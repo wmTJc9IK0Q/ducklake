@@ -1886,6 +1886,22 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 	}
 	// Add ORDER BY clause for Top-N optimization if generated
 	query += order_by_clause;
+
+	// The file list is a pure function of (table, snapshot, generated query)
+	// over committed metadata, so repeated identical scans can skip the metadata
+	// SQL. Snapshot-keyed: a new commit moves the snapshot id, misses, and
+	// recomputes, so a cached entry never serves data the snapshot would not
+	// have returned. Only the static-filter path is cached - Top-N dynamic
+	// filters carry per-execution pruning state and their results are not stable
+	// across executions.
+	DuckLakeFileListCacheKey file_list_cache_key(table_id, snapshot.snapshot_id, snapshot.schema_version, query);
+	const bool use_file_list_cache = dynamic_filter_columns.empty();
+	if (use_file_list_cache) {
+		if (auto cached = transaction.GetCatalog().GetFileListCache().Lookup(file_list_cache_key)) {
+			return *cached;
+		}
+	}
+
 	auto result = Query(snapshot, query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to get data file list from DuckLake: ");
@@ -1937,6 +1953,9 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
 		}
 
 		files.push_back(std::move(file_entry));
+	}
+	if (use_file_list_cache) {
+		transaction.GetCatalog().GetFileListCache().Store(file_list_cache_key, files);
 	}
 	return files;
 }

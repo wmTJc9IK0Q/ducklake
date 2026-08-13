@@ -20,6 +20,7 @@
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/storage/object_cache.hpp"
 #include "storage/ducklake_catalog_set.hpp"
+#include "storage/ducklake_file_list_cache.hpp"
 #include "storage/ducklake_partition_data.hpp"
 #include "storage/ducklake_stats.hpp"
 
@@ -283,6 +284,10 @@ public:
 	                                                   DuckLakeCatalogSet &schema);
 	//! Return the schema for the given snapshot - loading it if it is not yet loaded
 	DuckLakeCatalogSet &GetSchemaForSnapshot(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot);
+	//! Snapshot-keyed file-list results cache (see DuckLakeFileListCache).
+	DuckLakeFileListCache &GetFileListCache() {
+		return file_list_cache;
+	}
 
 	//! Callback type for instrumenting metadata queries
 	using QueryCallback = std::function<void(const string &query, std::chrono::steady_clock::duration elapsed)>;
@@ -367,6 +372,8 @@ private:
 	//! The id of the last committed snapshot, set at FlushChanges on a successful commit
 	mutable mutex commit_lock;
 	optional_idx last_committed_snapshot;
+	//! Snapshot-keyed file-list results cache (see ducklake_file_list_cache.hpp)
+	DuckLakeFileListCache file_list_cache;
 	//! Optional callback for instrumenting metadata queries
 	QueryCallback query_callback;
 };
