@@ -44,9 +44,6 @@ public:
 	unique_ptr<MultiFileList> Copy() const override;
 	vector<DuckLakeFileListExtendedEntry> GetFilesExtended() const;
 	const vector<DuckLakeFileListEntry> &GetFiles() const;
-	bool HasTransactionLocalData() const {
-		return !transaction_local_files.empty() || transaction_local_data != nullptr;
-	}
 	const DuckLakeFileListEntry &GetFileEntry(idx_t file_idx) const;
 	optional_ptr<const FilterPushdownInfo> GetFilterInfo() const {
 		return filter_info.get();

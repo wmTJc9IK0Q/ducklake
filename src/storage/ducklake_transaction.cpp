@@ -1605,7 +1605,7 @@ Identifier DuckLakeTransaction::GetDefaultSchemaName() {
 	auto &metadata_context = *connection->context;
 	auto &db_manager = DatabaseManager::Get(metadata_context);
 	auto metadb = db_manager.GetDatabase(metadata_context, Identifier(ducklake_catalog.MetadataDatabaseName()));
-	return Identifier(metadb->GetCatalog().GetDefaultSchema());
+	return metadb->GetCatalog().GetDefaultSchema();
 }
 
 DuckLakeSnapshot DuckLakeTransaction::GetSnapshot() {
