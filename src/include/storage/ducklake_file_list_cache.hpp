@@ -22,34 +22,44 @@ namespace duckdb {
 
 //! Key identifying one DuckLakeMetadataManager::GetFilesForTable result.
 //!
-//! The file list a scan reads is a pure function of (table, snapshot,
-//! filter pushdown) over committed metadata: the metadata rows a snapshot
-//! references are immutable once that snapshot is committed, and the generated
-//! SQL fully encodes the filter pushdown (zone maps, bucket pruning, stats CTEs).
-//! `query` is the SQL before catalog/snapshot placeholder substitution, so two
-//! executions that resolve the same snapshot and build the same filters produce
-//! the same key.
+//! The file list for a snapshot is NOT immutable once that snapshot is committed:
+//! flushing inlined data moves rows the old snapshot saw out of the inlined tables
+//! and into new data files that carry the old snapshot range. A file list cached
+//! before such a commit, combined with inlined tables read after it, loses those
+//! rows. So the key carries the snapshot the reading transaction started from
+//! (`transaction_snapshot_id`) besides the one it scans (`snapshot_id`, which
+//! differs under AT (VERSION => ...)). A transaction reads its metadata as of its
+//! own snapshot, so equal keys see equal metadata, and any commit moves the
+//! transaction snapshot of later readers and misses.
+//!
+//! `query` is the SQL before catalog/snapshot placeholder substitution and fully
+//! encodes the filter pushdown (zone maps, bucket pruning, stats CTEs).
 struct DuckLakeFileListCacheKey {
-	DuckLakeFileListCacheKey(TableIndex table_id_p, idx_t snapshot_id_p, idx_t schema_version_p, string query_p)
-	    : table_id(table_id_p), snapshot_id(snapshot_id_p), schema_version(schema_version_p),
-	      query(std::move(query_p)) {
+	DuckLakeFileListCacheKey(TableIndex table_id_p, idx_t transaction_snapshot_id_p, idx_t snapshot_id_p,
+	                         idx_t schema_version_p, string query_p)
+	    : table_id(table_id_p), transaction_snapshot_id(transaction_snapshot_id_p), snapshot_id(snapshot_id_p),
+	      schema_version(schema_version_p), query(std::move(query_p)) {
 	}
 
 	TableIndex table_id;
+	//! The snapshot of the reading transaction - the metadata state the list was computed from
+	idx_t transaction_snapshot_id;
+	//! The snapshot being scanned
 	idx_t snapshot_id;
 	idx_t schema_version;
 	//! Generated metadata SQL before {METADATA_CATALOG}/{SNAPSHOT_ID} substitution.
 	string query;
 
 	bool operator==(const DuckLakeFileListCacheKey &other) const {
-		return table_id.index == other.table_id.index && snapshot_id == other.snapshot_id &&
-		       schema_version == other.schema_version && query == other.query;
+		return table_id.index == other.table_id.index && transaction_snapshot_id == other.transaction_snapshot_id &&
+		       snapshot_id == other.snapshot_id && schema_version == other.schema_version && query == other.query;
 	}
 };
 
 struct DuckLakeFileListCacheKeyHash {
 	size_t operator()(const DuckLakeFileListCacheKey &key) const {
 		hash_t result = duckdb::Hash(key.snapshot_id);
+		result = duckdb::CombineHash(result, duckdb::Hash(key.transaction_snapshot_id));
 		result = duckdb::CombineHash(result, duckdb::Hash(key.schema_version));
 		result = duckdb::CombineHash(result, duckdb::Hash(key.table_id));
 		result = duckdb::CombineHash(result, duckdb::Hash(key.query.c_str(), key.query.size()));
@@ -58,12 +68,11 @@ struct DuckLakeFileListCacheKeyHash {
 };
 
 //! A bounded LRU of DuckLakeMetadataManager::GetFilesForTable results, keyed by
-//! (table, snapshot, generated query).
+//! (table, transaction snapshot, scanned snapshot, generated query).
 //!
-//! Snapshot-keyed means a new commit - a new snapshot id - misses and
-//! recomputes, so cached entries never serve data a later snapshot would not
-//! have served: the correctness frontier is identical to recomputing every
-//! time. This is what lets repeated identical scans skip the expensive
+//! Any commit moves the snapshot later transactions start from, so they miss and
+//! recompute: cached entries never serve a file list the current metadata would
+//! not produce. This is what lets repeated identical scans skip the expensive
 //! file-list/statistics metadata SQL entirely.
 class DuckLakeFileListCache {
 public:
@@ -73,7 +82,7 @@ public:
 	static constexpr idx_t DUCKLAKE_FILE_LIST_CACHE_CAPACITY = 512;
 
 public:
-	//! Returns the cached file list for (table, snapshot, query), or nullptr.
+	//! Returns the cached file list for the key, or nullptr.
 	shared_ptr<const vector<DuckLakeFileListEntry>> Lookup(const DuckLakeFileListCacheKey &key) {
 		lock_guard<mutex> guard(lock);
 		auto entry = entries.find(key);
@@ -87,9 +96,8 @@ public:
 		return entry->second.value;
 	}
 
-	//! Store the file list for (table, snapshot, query). Misses and recomputes
-	//! when the same key was already cached with different content are not
-	//! possible: the key is deterministic for identical committed metadata.
+	//! Store the file list for the key. The same key cannot map to different
+	//! content: equal keys read equal committed metadata.
 	void Store(const DuckLakeFileListCacheKey &key, const vector<DuckLakeFileListEntry> &files) {
 		lock_guard<mutex> guard(lock);
 		auto entry = entries.find(key);

@@ -2104,17 +2104,19 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
 
 	auto query = GenerateFileListQuery(table, filter_info, dynamic_filter_columns, runtime_filter_stats_columns);
 
-	// The file list is a pure function of (table, snapshot, generated query)
-	// over committed metadata, so repeated identical scans can skip the metadata
-	// SQL. Snapshot-keyed: a new commit moves the snapshot id, misses, and
-	// recomputes, so a cached entry never serves data the snapshot would not
-	// have returned. Only the static-filter path is cached - Top-N dynamic
-	// filters carry per-execution pruning state and their results are not stable
-	// across executions.
-	DuckLakeFileListCacheKey file_list_cache_key(table_id, snapshot.snapshot_id, snapshot.schema_version, query);
-	const bool use_file_list_cache = dynamic_filter_columns.empty();
+	// Repeated identical scans skip the metadata SQL through a cache keyed by the
+	// reading transaction's snapshot as well as the scanned one, because a commit
+	// that flushes inlined data rewrites what an older snapshot's file list is (see
+	// DuckLakeFileListCacheKey). Not used for catalogs pinned to a snapshot: their
+	// transaction snapshot does not move when others commit. Not used for Top-N
+	// dynamic filters either: they carry per-execution pruning state and their
+	// results are not stable across executions.
+	auto &catalog = transaction.GetCatalog();
+	const bool use_file_list_cache = dynamic_filter_columns.empty() && !catalog.CatalogSnapshot();
+	DuckLakeFileListCacheKey file_list_cache_key(table_id, use_file_list_cache ? transaction.GetSnapshot().snapshot_id : 0,
+	                                             snapshot.snapshot_id, snapshot.schema_version, query);
 	if (use_file_list_cache) {
-		if (auto cached = transaction.GetCatalog().GetFileListCache().Lookup(file_list_cache_key)) {
+		if (auto cached = catalog.GetFileListCache().Lookup(file_list_cache_key)) {
 			return *cached;
 		}
 	}

@@ -84,12 +84,6 @@ CALL truncate_duckdb_logs()
 statement ok
 RESET ducklake_target_file_size
 
-query II
-SELECT (SELECT count(*) FROM ducklake_list_files('ducklake', 'few')),
-(SELECT count(*) FROM ducklake_list_files('ducklake', 'many'))
-----
-4	40
-
 # deletes that write a delete file for each of 4 and 40 files
 
 statement ok
@@ -127,6 +121,14 @@ CALL disable_logging()
 
 statement ok
 CALL truncate_duckdb_logs()
+
+# checked after the deletes: listing the files fills the file list cache for the
+# current snapshot, which would let only the first delete skip its file list query
+query II
+SELECT (SELECT count(*) FROM ducklake_list_files('ducklake', 'few')),
+(SELECT count(*) FROM ducklake_list_files('ducklake', 'many'))
+----
+4	40
 
 query II
 SELECT (SELECT count(*) FROM ducklake.few), (SELECT count(*) FROM ducklake.many)
