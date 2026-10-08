@@ -28,14 +28,18 @@
     {
       "reason": "Test only for SQLite as catalog",
       "paths": [
-        "test/sql/metadata/ducklake_settings_sqlite.test"
+        "test/sql/metadata/ducklake_settings_sqlite.test",
+        "test/sql/data_inlining/data_inlining_variant_sql_rollback.test"
       ]
     },
     {
       "reason": "Test only for Postgres as catalog",
       "paths": [
         "test/sql/metadata/ducklake_settings_postgres.test",
-        "test/sql/metadata/metadata_schema_scoped_attach.test"
+        "test/sql/metadata/metadata_schema_scoped_attach.test",
+        "test/sql/benchmark/postgres_catalog.test",
+        "test/sql/issues/issue_843_postgres_legacy_inlined_types.test",
+        "test/sql/data_inlining/inlined_superseded_drop_failure_postgres.test"
       ]
     },
     {
@@ -69,7 +73,8 @@
     {
       "reason": "Test issues UPDATE against the metadata catalog directly",
       "paths": [
-        "test/sql/delete/delete_legacy_missing_mapping_after_rename_add_files.test"
+        "test/sql/delete/delete_legacy_missing_mapping_after_rename_add_files.test",
+        "test/sql/rewrite_data_files/test_rewrite_many_non_candidate_files.test"
       ]
     },
     {
@@ -85,9 +90,14 @@
       ]
     },
     {
-      "reason": "MinIo",
+      "reason": "Uses the S3 test server",
       "paths": [
-        "test/sql/delete/delete_metadata.test",
+        "test/sql/delete/delete_metadata.test"
+      ]
+    },
+    {
+      "reason": "mode skip in the test itself",
+      "paths": [
         "test/sql/general/prepared_statement.test"
       ]
     },
@@ -103,7 +113,7 @@
         "test/sql/autoloading/autoload_data_path.test",
         "test/sql/data_inlining/postgres_identifier_limit.test",
         "test/sql/issues/issue_sqlite_snapshot_time.test",
-        "test/sql/metadata/ducklake_settings_minio.test"
+        "test/sql/metadata/ducklake_settings_s3.test"
       ]
     },
     {
@@ -113,21 +123,21 @@
       ]
     },
     {
-      "reason": "ROLLBACK after ducklake_flush_inlined_data does not restore ducklake_inlined_delete_* rows on the quack-backed metadata catalog (line 162 expects 15 rows after rollback, gets 0). Each `CALL quack_query(uri, sql)` opens a fresh server-side connection that auto-commits independently of the outer DuckLake transaction. Proper fix needs metadata operations routed through a transaction-scoped server-side connection (e.g., reuse the local QuackCatalog's connection_id via quack_query_by_name and have the catalog's QuackTransaction lifecycle drive server-side BEGIN/COMMIT/ROLLBACK).",
+      "reason": "set_option writes its ducklake_metadata row eagerly instead of staging it for commit like every other change, so a ROLLBACK leaves the row behind on quack, where each metadata statement runs on the server outside the local transaction. Rolled-back DDL is unaffected - that is only written at commit.",
       "paths": [
-        "test/sql/deletion_inlining/test_deletion_inlining_transaction.test"
+        "test/sql/stats/skip_stats_columns_transaction.test"
       ]
     },
     {
-      "reason": "ROLLBACK after ducklake_expire_snapshots does not restore expired snapshot rows on the quack-backed metadata catalog. DuckLake sends metadata SQL through quack_query_by_name, which sends a PrepareRequestMessage directly and does not route through QuackTransaction's remote BEGIN/ROLLBACK path.",
+      "reason": "Snapshots expire when the transaction commits on quack so a rollback keeps them, so a cleanup in the same transaction does not see their files yet.",
       "paths": [
-        "test/sql/issues/issue_852_cache_growth.test"
+        "test/sql/transaction/expire_cleanup_same_transaction.test"
       ]
     },
     {
-      "reason": "FIXME: A failed client-side commit batch is not atomic on the quack server.",
+      "reason": "FIXME: Each metadata query runs in its own server-side transaction on quack, so a reader that began before a concurrent TRUNCATE reads the post-truncate record counts from ducklake_table_stats.",
       "paths": [
-        "test/sql/quack/server_side_commit_atomicity.test"
+        "test/sql/metadata/duckdb_tables_record_counts_concurrent.test"
       ]
     },
     {
@@ -181,7 +191,7 @@
       ]
     },
     {
-      "reason": "FIXME: Column name \"begin_snapshot\" is reserved by DuckLake for internal use",
+      "reason": "FIXME: COPY FROM DATABASE on quack leaks metadata tables into the target, previously surfaced as a reserved column name error",
       "paths": [
         "test/sql/partitioning/partition_tpch.test_slow"
       ]
@@ -204,6 +214,7 @@
         "test/sql/partitioning/bucket_pruning.test",
         "test/sql/partitioning/merge_adjacent_null_partition.test",
         "test/sql/partitioning/partition_rename_in_transaction.test",
+        "test/sql/partitioning/data_inlining_disable_hive_partitioning.test",
         "test/sql/rewrite_data_files/test_rewrite_partitioning.test",
         "test/sql/sorted_table/merge_adjacent_sorted_basic.test",
         "test/sql/sorted_table/merge_adjacent_sorted_drop_recreate.test",
@@ -232,6 +243,12 @@
       "paths": [
         "test/sql/retry/commit_failure.test",
         "test/sql/settings/max_retry_count.test"
+      ]
+    },
+    {
+      "reason": "The commit batch of a quack catalog is sent through quack_query_by_name, so the number of column inserts cannot be counted",
+      "paths": [
+        "test/sql/issues/issue_1146_column_insert_batches.test"
       ]
     }
   ]

@@ -8,6 +8,7 @@
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_stats.hpp"
 #include "storage/ducklake_transaction.hpp"
+#include "storage/ducklake_metadata_manager.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_data.hpp"
@@ -20,6 +21,8 @@
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 
 namespace duckdb {
 
@@ -47,6 +50,7 @@ static void DuckLakeGetMetrics(TableFunctionGetMetricsInput &input) {
 	idx_t data_files_read = 0;
 	idx_t data_files_skipped = 0;
 	idx_t inlined_tables_read = 0;
+	lock_guard<mutex> guard(gstate.lock); // guards gstate.readers
 	for (idx_t i = 0; i < files_loaded && i < files.size() && i < gstate.readers.size(); i++) {
 		bool is_skipped = gstate.readers[i]->file_state == MultiFileFileState::SKIPPED;
 		switch (files[i].data_type) {
@@ -222,7 +226,12 @@ vector<PartitionStatistics> DuckLakeGetPartitionStats(ClientContext &context, Ge
 		return result;
 	}
 
-	idx_t net_count = table.GetNetDataFileRowCount(*transaction) + table.GetNetInlinedRowCount(*transaction);
+	auto file_count =
+	    transaction->GetMetadataManager().GetNetDataFileRowCountForStats(table_id, transaction->GetSnapshot());
+	if (!file_count.IsValid()) {
+		return result;
+	}
+	idx_t net_count = file_count.GetIndex() + table.GetNetInlinedRowCount(*transaction);
 
 	// MIN/MAX can be answered from the catalog column stats, but only when those stats are exact.
 	// Global column stats only ever widen on insert (via MergeStats) and are never tightened by deletes
@@ -230,7 +239,7 @@ vector<PartitionStatistics> DuckLakeGetPartitionStats(ClientContext &context, Ge
 	// record_count (total ever inserted) equals the net (delete-adjusted) row count. count(*) is unaffected
 	// either way: it does not consult MinMaxIsExact and subtracts delete counts independently.
 	auto table_stats = table.GetTableStats(*transaction);
-	bool min_max_exact = table_stats && table_stats->record_count == net_count;
+	bool min_max_exact = table_stats && !table_stats->record_count_unknown && table_stats->record_count == net_count;
 
 	// Return single partition with total count
 	PartitionStatistics stats;
@@ -251,7 +260,7 @@ TableFunction DuckLakeFunctions::GetDuckLakeScanFunction(DatabaseInstance &insta
 	auto parquet_entry = loader.TryGetTableFunction("parquet_scan");
 	if (parquet_entry) {
 		auto &parquet_scan = parquet_entry->Cast<TableFunctionCatalogEntry>();
-		function = parquet_scan.functions.GetFunctionByOffset(0);
+		function = *parquet_scan.functions.GetFunctionByOffset(0);
 		function.get_multi_file_reader = DuckLakeMultiFileReader::CreateInstance;
 	}
 
@@ -286,10 +295,8 @@ shared_ptr<DuckLakeFunctionInfo>
 DuckLakeFunctionInfo::Create(DuckLakeTableEntry &table, DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot) {
 	auto result = make_shared_ptr<DuckLakeFunctionInfo>(table, transaction, snapshot);
 	result->table_name = table.name.GetIdentifierName();
-	for (auto &col : table.GetColumns().Logical()) {
-		result->column_names.push_back(col.Name().GetIdentifierName());
-		result->column_types.push_back(col.Type());
-	}
+	result->column_names = table.GetColumns().GetColumnNames();
+	result->column_types = table.GetColumns().GetColumnTypes();
 	result->table_id = table.GetTableId();
 	return result;
 }
@@ -313,42 +320,46 @@ bool DuckLakeFunctionInfo::CanUseGlobalStats() {
 }
 
 void DuckLakeScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-                           const TableFunction &function) {
+                           const BoundTableFunction &function) {
 	auto &func_info = function.function_info->Cast<DuckLakeFunctionInfo>();
 	auto &catalog = func_info.table.ParentCatalog();
 	serializer.WriteProperty(100, "catalog_name", catalog.GetName());
 	serializer.WriteProperty(101, "schema_name", func_info.table.ParentSchema().name);
 	serializer.WriteProperty(102, "table_name", func_info.table_name);
-	serializer.WriteObject(103, "snapshot", [&](Serializer &obj) { func_info.snapshot.Serialize(obj); });
+	serializer.WriteProperty(103, "snapshot", func_info.snapshot);
 	serializer.WriteProperty(104, "scan_type", static_cast<uint8_t>(func_info.scan_type));
 	bool has_start_snapshot = func_info.start_snapshot != nullptr;
 	serializer.WriteProperty(105, "has_start_snapshot", has_start_snapshot);
 	if (has_start_snapshot) {
-		serializer.WriteObject(106, "start_snapshot",
-		                       [&](Serializer &obj) { func_info.start_snapshot->Serialize(obj); });
+		serializer.WriteProperty(106, "start_snapshot", *func_info.start_snapshot);
 	}
+	serializer.WriteProperty(107, "qualified_name",
+	                         func_info.table.ParentSchema().GetQualifiedName(Identifier(func_info.table_name)));
 }
 
-unique_ptr<FunctionData> DuckLakeScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+unique_ptr<FunctionData> DuckLakeScanDeserialize(Deserializer &deserializer, BoundTableFunction &function) {
 	auto &context = deserializer.Get<ClientContext &>();
 	auto catalog_name = deserializer.ReadProperty<string>(100, "catalog_name");
 	auto schema_name = deserializer.ReadProperty<string>(101, "schema_name");
 	auto table_name = deserializer.ReadProperty<string>(102, "table_name");
-	DuckLakeSnapshot snapshot;
-	deserializer.ReadObject(103, "snapshot", [&](Deserializer &obj) { snapshot = DuckLakeSnapshot::Deserialize(obj); });
+	auto snapshot = deserializer.ReadProperty<DuckLakeSnapshot>(103, "snapshot");
 	auto scan_type = static_cast<DuckLakeScanType>(deserializer.ReadPropertyWithExplicitDefault<uint8_t>(
 	    104, "scan_type", static_cast<uint8_t>(DuckLakeScanType::SCAN_TABLE)));
 	bool has_start_snapshot = deserializer.ReadPropertyWithExplicitDefault<bool>(105, "has_start_snapshot", false);
 	unique_ptr<DuckLakeSnapshot> start_snapshot;
 	if (has_start_snapshot) {
 		start_snapshot = make_uniq<DuckLakeSnapshot>();
-		deserializer.ReadObject(106, "start_snapshot",
-		                        [&](Deserializer &obj) { *start_snapshot = DuckLakeSnapshot::Deserialize(obj); });
+		deserializer.ReadProperty(106, "start_snapshot", *start_snapshot);
+	}
+	auto qualified_name =
+	    deserializer.ReadPropertyWithExplicitDefault<QualifiedName>(107, "qualified_name", QualifiedName());
+	if (qualified_name.Path().empty()) {
+		qualified_name = QualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(table_name));
 	}
 
 	// If ducklake_scan was registered before parquet was loaded, we set it now
 	if (!function.bind) {
-		function = DuckLakeFunctions::GetDuckLakeScanFunction(*context.db);
+		function = BoundTableFunction(DuckLakeFunctions::GetDuckLakeScanFunction(*context.db));
 		if (!function.bind) {
 			throw InvalidInputException("ducklake_scan requires the parquet extension to be loaded");
 		}
@@ -358,9 +369,13 @@ unique_ptr<FunctionData> DuckLakeScanDeserialize(Deserializer &deserializer, Tab
 	auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 	auto &transaction = DuckLakeTransaction::Get(context, catalog);
 
-	auto &table_entry = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog_name), Identifier(schema_name),
-	                                                         Identifier(table_name))
-	                        .Cast<DuckLakeTableEntry>();
+	// a time travel scan finds its table at the serialized snapshot
+	unique_ptr<BoundAtClause> at_clause;
+	if (snapshot.snapshot_id != transaction.GetSnapshot().snapshot_id) {
+		at_clause = make_uniq<BoundAtClause>("version", Value::UBIGINT(snapshot.snapshot_id));
+	}
+	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, qualified_name, at_clause.get(), QueryErrorContext());
+	auto &table_entry = Catalog::GetEntry(context, table_lookup).Cast<DuckLakeTableEntry>();
 
 	function.function_info = DuckLakeFunctionInfo::Create(table_entry, transaction, snapshot);
 	auto &func_info = function.function_info->Cast<DuckLakeFunctionInfo>();

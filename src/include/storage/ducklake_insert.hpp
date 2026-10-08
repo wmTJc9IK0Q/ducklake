@@ -12,20 +12,22 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/operator/logical_copy_to_file.hpp"
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/common/index_vector.hpp"
 #include "storage/ducklake_stats.hpp"
 #include "common/ducklake_data_file.hpp"
 #include "storage/ducklake_field_data.hpp"
+#include "storage/ducklake_partition_data.hpp"
+#include "storage/ducklake_sort_data.hpp"
 
 namespace duckdb {
 class DuckLakeCatalog;
 class DuckLakeSchemaEntry;
 class DuckLakeTableEntry;
 class DuckLakeFieldData;
-struct DuckLakePartition;
+class DuckLakeInlineData;
 struct DuckLakeCopyOptions;
 struct DuckLakeCopyInput;
 
@@ -43,17 +45,51 @@ public:
 	idx_t rows_flushed = 0;
 };
 
+//! Refuses NULL values of NOT NULL columns whose file statistics cannot show them
+class DuckLakeVerifyNotNull : public PhysicalOperator {
+public:
+	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
+
+public:
+	DuckLakeVerifyNotNull(PhysicalPlan &physical_plan, PhysicalOperator &child, Identifier table_name,
+	                      vector<pair<idx_t, Identifier>> columns);
+
+	Identifier table_name;
+	//! The index and name of every column to check
+	vector<pair<idx_t, Identifier>> columns;
+
+public:
+	//! Adds the check to a plan that produces the physical columns of the table, if a column needs it
+	static PhysicalOperator &Plan(PhysicalPlanGenerator &planner, DuckLakeTableEntry &table, PhysicalOperator &plan);
+
+	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
+	                           GlobalOperatorState &gstate, OperatorState &state) const override;
+	bool ParallelOperator() const override {
+		return true;
+	}
+	string GetName() const override;
+};
+
+struct DuckLakeInsertPipeline {
+	reference<PhysicalOperator> root;
+	optional_ptr<DuckLakeInlineData> inline_data;
+	bool sorted = false;
+
+	PhysicalOperator &AttachInsert(PhysicalOperator &insert, PhysicalOperator &copy);
+};
+
 class DuckLakeInsert : public PhysicalOperator {
 public:
-	//! INSERT INTO
+	//! INSERT INTO an existing table.
 	DuckLakeInsert(PhysicalPlan &physical_plan, const vector<LogicalType> &types, DuckLakeTableEntry &table,
 	               optional_idx partition_id, string encryption_key);
-	//! CREATE TABLE AS
+	//! CREATE TABLE AS: table created in GetGlobalSinkState; inline partition/sort specs prebuilt for the write.
 	DuckLakeInsert(PhysicalPlan &physical_plan, const vector<LogicalType> &types, SchemaCatalogEntry &schema,
 	               unique_ptr<BoundCreateTableInfo> info, string table_uuid, string table_data_path,
-	               string encryption_key);
+	               unique_ptr<DuckLakePartition> ctas_partition_data, unique_ptr<DuckLakeSort> ctas_sort_data,
+	               map<string, string> ctas_table_options, string encryption_key);
 
-	//! The table to insert into
+	//! The table to insert into (only set for INSERT INTO; nullptr for CTAS until GetGlobalSinkState resolves)
 	optional_ptr<DuckLakeTableEntry> table;
 	//! Table schema, in case of CREATE TABLE AS
 	optional_ptr<SchemaCatalogEntry> schema;
@@ -63,6 +99,12 @@ public:
 	string table_uuid;
 	//! The table data path, in case of CREATE TABLE AS
 	string table_data_path;
+	//! Prebuilt CTAS partition spec (allocated at planning time to fix the write's partition_id).
+	unique_ptr<DuckLakePartition> ctas_partition_data;
+	//! Pre-built sort spec for CTAS (same lifecycle as ctas_partition_data).
+	unique_ptr<DuckLakeSort> ctas_sort_data;
+	//! Options from CREATE TABLE AS ... WITH
+	map<string, string> ctas_table_options;
 	//! The partition id we are writing into (if any)
 	optional_idx partition_id;
 	//! The encryption key used for writing the Parquet files
@@ -77,14 +119,14 @@ public:
 		return true;
 	}
 
-	static void InsertCasts(const vector<LogicalType> &types, ClientContext &context, PhysicalPlanGenerator &planner,
-	                        optional_ptr<PhysicalOperator> &plan);
-	static unique_ptr<LogicalOperator> InsertCasts(Binder &binder, unique_ptr<LogicalOperator> &plan);
-
 	static DuckLakeColumnStats ParseColumnStats(const LogicalType &type, const vector<Value> &stats);
+	static unique_ptr<CopyInfo> GetParquetCopyInfo(const string &file_path, Value field_ids,
+	                                               const string &encryption_key);
 	static DuckLakeCopyOptions GetCopyOptions(ClientContext &context, DuckLakeCopyInput &copy_input);
-	//! Row group size (batch size) configured for a copy, defaulting to DEFAULT_ROW_GROUP_SIZE.
-	static idx_t GetCopyBatchSize(const DuckLakeCopyOptions &copy_options);
+	static DuckLakeInsertPipeline PlanInsertPipeline(ClientContext &context, PhysicalPlanGenerator &planner,
+	                                                 PhysicalOperator &plan, const ColumnList &columns,
+	                                                 const Identifier &table_name, optional_ptr<DuckLakeSort> sort_data,
+	                                                 bool sort_on_insert, idx_t data_inlining_row_limit);
 	static PhysicalOperator &PlanCopyForInsert(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                           DuckLakeCopyInput &copy_input, optional_ptr<PhysicalOperator> plan);
 	static PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
@@ -116,42 +158,22 @@ public:
 };
 
 struct DuckLakeCopyOptions {
-	DuckLakeCopyOptions(unique_ptr<CopyInfo> info, CopyFunction copy_function);
-
-	unique_ptr<CopyInfo> info;
-	CopyFunction copy_function;
-	unique_ptr<FunctionData> bind_data;
-
-	string file_path;
-	bool use_tmp_file;
-	FilenamePattern filename_pattern;
-	string file_extension;
-	CopyOverwriteMode overwrite_mode;
-	bool per_thread_output;
-	optional_idx file_size_bytes;
-	bool rotate;
-	CopyFunctionReturnType return_type;
-	bool hive_file_pattern;
-
-	bool partition_output;
-	bool write_partition_columns;
-	bool write_empty_file = true;
-	vector<idx_t> partition_columns;
-	vector<Identifier> names;
-	vector<LogicalType> expected_types;
-
+	unique_ptr<LogicalCopyToFile> copy;
 	//! Set of projection columns to execute prior to inserting (if any)
 	vector<unique_ptr<Expression>> projection_list;
 };
 
 struct DuckLakeCopyInput {
 	explicit DuckLakeCopyInput(ClientContext &context, DuckLakeTableEntry &table, const string &hive_partition = "");
+	//! CTAS ctor: field_data (required) + optional partition_data supplied directly, before the table entry exists.
 	DuckLakeCopyInput(ClientContext &context, DuckLakeSchemaEntry &schema, const ColumnList &columns,
-	                  const string &data_path_p);
+	                  const string &data_path_p, DuckLakeFieldData &field_data,
+	                  optional_ptr<DuckLakePartition> partition_data = nullptr);
 
 	DuckLakeCatalog &catalog;
 	optional_ptr<DuckLakePartition> partition_data;
 	optional_ptr<DuckLakeFieldData> field_data;
+	map<string, string> table_options;
 	const ColumnList &columns;
 	const string data_path;
 	string encryption_key;
@@ -159,6 +181,8 @@ struct DuckLakeCopyInput {
 	TableIndex table_id;
 	InsertVirtualColumns virtual_columns = InsertVirtualColumns::NONE;
 	optional_idx get_table_index;
+	//! Whether the rows reach the copy in the order they must be written in
+	bool ordered_input = false;
 };
 
 } // namespace duckdb

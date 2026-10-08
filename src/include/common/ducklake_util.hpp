@@ -8,41 +8,57 @@
 
 #pragma once
 
+#include "duckdb/parser/parsed_expression.hpp"
+
 #include "common/index.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/map.hpp"
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/types/value.hpp"
 
 namespace duckdb {
+class ClientContext;
+class ColumnDataCollection;
 class DataChunk;
 class ColumnList;
+class DuckLakeCatalog;
 class DuckLakeMetadataManager;
+class DuckLakeTransaction;
 class FileSystem;
-class TableFilter;
-struct DynamicFilterData;
+class Expression;
+class LogicalType;
 
 struct ParsedCatalogEntry {
-	string schema;
+	vector<string> schema_path;
 	string name;
+
+	string SchemaKey() const;
 };
 
 class DuckLakeUtil {
 public:
+	//! Extracts the value of a literal, or of a cast over a literal, as written in a DEFAULT or parameter default
+	static bool TryGetLiteralValue(const ParsedExpression &expr, Value &result);
+	//! Extracts a macro parameter default that can be stored as a literal of its DuckLake type
+	static bool TryGetMacroDefaultLiteral(const ParsedExpression &expr, Value &result);
 	static string ParseQuotedValue(const string &input, idx_t &pos);
 	static string ToQuotedList(const vector<string> &input, char list_separator = ',');
 	static vector<string> ParseQuotedList(const string &input, char list_separator = ',');
-	static string SQLIdentifierToString(const string &text);
-	static string SQLIdentifierToString(const Identifier &identifier);
-	static string SQLLiteralToString(const string &text);
 	static string StatsToString(const string &text);
 	static string ValueToSQL(DuckLakeMetadataManager &metadata_manager, ClientContext &context, const Value &val);
 
 	static ParsedCatalogEntry ParseCatalogEntry(const string &input);
 	static string JoinPath(FileSystem &fs, const string &a, const string &b);
 
-	static shared_ptr<DynamicFilterData> GetOptionalDynamicFilterData(const TableFilter &filter);
+	//! Combine two filter expressions - both must hold, so AND their conjuncts and drop duplicates
+	static unique_ptr<Expression> MergeFilterExpressions(unique_ptr<Expression> left, unique_ptr<Expression> right);
+	//! Whether an expression reads a struct field by a constant name or position
+	static bool IsStructExtract(const Expression &expr);
+	//! A leaf filter is evaluated against a single column's stats, so it may only read one column. Returns
+	//! that sub-expression, or nullptr when the filter reads none or several.
+	static optional_ptr<const Expression> GetFilterSubject(const Expression &expr);
 
 	//! Create the data path directory if it does not yet exist
 	static void EnsureDirectoryExists(FileSystem &fs, const string &data_path);
@@ -52,7 +68,7 @@ public:
 	static string ReplaceSkippingQuotes(const string &sql, const string &from, const string &to);
 
 	//! Returns true if the given column name conflicts with inlined data system columns
-	static bool IsInlinedSystemColumn(const string &name);
+	static bool IsInlinedSystemColumn(const string &name, bool prefixed_inlined_columns);
 
 	static string OptionalIdxOrNull(const optional_idx &v);
 
@@ -64,14 +80,35 @@ public:
 
 	static string PartitionValueLiteral(const Value &v);
 
-	static string ChunkRowToSQL(DuckLakeMetadataManager &metadata_manager, ClientContext &context, DataChunk &chunk,
-	                            idx_t row);
-	//! Throws if any column in the list conflicts with inlined data system columns
-	static void ValidateNoInlinedSystemColumns(const ColumnList &columns, const string &table_name = "");
+	//! Throws if a column name is reserved for inlined data metadata on this catalog
+	static void ValidateInlinedSystemColumn(DuckLakeCatalog &catalog, ClientContext &context, SchemaIndex schema_id,
+	                                        TableIndex table_id, const string &name,
+	                                        optional_ptr<const map<string, string>> table_options = nullptr);
+	static void ValidateNoInlinedSystemColumns(DuckLakeCatalog &catalog, ClientContext &context, SchemaIndex schema_id,
+	                                           const ColumnList &columns,
+	                                           optional_ptr<const map<string, string>> table_options = nullptr);
+	//! Throws if a column conflicts with inlined data metadata columns when enabling inlining
+	static void ValidateCanEnableInlining(const ColumnList &columns, bool prefixed_inlined_columns,
+	                                      const string &table_name);
 
 	//! Copy extension-registered settings from one context onto another. Core engine settings
 	//! are not copied.
 	static void CopyExtensionSettings(ClientContext &from, ClientContext &to);
+
+	static string ParseConfigOptionValue(ClientContext &context, const string &option, const Value &val);
+	static void ValidateConfigOptionScope(const string &option, bool has_schema, bool has_table);
+	static void ValidateConfigOptionName(const string &option);
+
+	//! Storage type of an inlined column, VARIANT becomes a Parquet Variant BLOB where VARIANT is not native
+	static LogicalType GetInlinedStorageType(DuckLakeMetadataManager &metadata_manager, const LogicalType &type);
+	//! SQL expression encoding or decoding VARIANT leaves in an inlined column
+	static string InlinedVariantExpression(const string &expression, const LogicalType &type, bool encode,
+	                                       idx_t depth = 0);
+	//! SQL expression converting a value of the given type to the representation stored in an inlined column
+	static string InlinedStorageExpression(DuckLakeMetadataManager &metadata_manager, string expression,
+	                                       const LogicalType &type);
+	//! Formats inlined rows as comma separated cell literals in storage types
+	static vector<string> InlinedDataToSQL(DuckLakeTransaction &transaction, ColumnDataCollection &data);
 };
 
 } // namespace duckdb

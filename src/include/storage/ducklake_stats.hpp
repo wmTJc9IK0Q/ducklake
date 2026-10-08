@@ -9,14 +9,23 @@
 #pragma once
 
 #include "storage/ducklake_extra_stats.hpp"
+#include "duckdb/common/optional_ptr.hpp"
+
+#include <functional>
 
 namespace duckdb {
 class BaseStatistics;
 struct DuckLakeDataFile;
+struct DuckLakeGlobalStatsInfo;
 
 //! Returns true for types that require value-based (not lexicographic string) comparison for min/max stats
 inline bool RequiresValueComparison(const LogicalType &type) {
 	return type.IsNumeric() || type.IsTemporal() || type.id() == LogicalTypeId::BOOLEAN;
+}
+
+//! Finite bounds need an explicit UTC offset
+inline bool StatsBoundsRequireOffset(const LogicalType &type) {
+	return type.id() == LogicalTypeId::TIMESTAMP_TZ || type.id() == LogicalTypeId::TIMESTAMP_TZ_NS;
 }
 
 struct DuckLakeColumnStats;
@@ -43,7 +52,11 @@ struct DuckLakeColumnStats {
 	bool has_min = false;
 	bool has_max = false;
 	bool any_valid = true;
+	//! Invalidated bounds must never be reseeded
+	bool bounds_unknown = false;
 	bool has_contains_nan = false;
+	bool min_is_exact = false;
+	bool max_is_exact = false;
 
 	bool AnyValid() const {
 		if (has_num_values && has_null_count) {
@@ -51,15 +64,32 @@ struct DuckLakeColumnStats {
 		}
 		return any_valid;
 	}
+	//! Strings can have truncated min/max stats, other types are always exact
+	bool EffectiveMinIsExact() const {
+		return has_min && (min_is_exact || RequiresValueComparison(type));
+	}
+	bool EffectiveMaxIsExact() const {
+		return has_max && (max_is_exact || RequiresValueComparison(type));
+	}
 
 	unique_ptr<DuckLakeColumnExtraStats> extra_stats;
 
 public:
-	static DuckLakeColumnStats FromGlobalStats(const LogicalType &type, const DuckLakeGlobalColumnStatsInfo &col);
+	static DuckLakeColumnStats FromGlobalStats(const LogicalType &type, const DuckLakeGlobalColumnStatsInfo &col,
+	                                           bool table_has_rows);
+	//! The statistics of count values that are all the given value
+	static DuckLakeColumnStats FromConstant(const LogicalType &type, const Value &value, idx_t count);
+	//! Discards the min/max bounds, leaving the counts intact
+	void ClearBounds();
+	void CopyMinFrom(const DuckLakeColumnStats &other);
+	void CopyMaxFrom(const DuckLakeColumnStats &other);
+	static bool BoundsSurviveTypePromotion(const LogicalType &source, const LogicalType &target);
 	unique_ptr<BaseStatistics> ToStats() const;
 	void MergeStats(const DuckLakeColumnStats &new_stats);
 
 private:
+	void MergeBound(const DuckLakeColumnStats &new_stats, bool is_min, bool adopt_bounds);
+	void SetValidity(BaseStatistics &stats) const;
 	unique_ptr<BaseStatistics> CreateNumericStats() const;
 	unique_ptr<BaseStatistics> CreateStringStats() const;
 	unique_ptr<BaseStatistics> CreateVariantStats() const;
@@ -69,6 +99,7 @@ private:
 //! These are the global, table-wide stats
 struct DuckLakeTableStats {
 	idx_t record_count = 0;
+	bool record_count_unknown = false;
 	idx_t table_size_bytes = 0;
 	idx_t next_row_id = 0;
 	map<FieldIndex, DuckLakeColumnStats> column_stats;
@@ -76,6 +107,11 @@ struct DuckLakeTableStats {
 	void MergeStats(FieldIndex col_id, const DuckLakeColumnStats &file_stats);
 
 	void MergeFileStats(const DuckLakeDataFile &file);
+
+	//! Skips columns whose type lookup returns nullptr
+	static unique_ptr<DuckLakeTableStats>
+	FromGlobalStats(const DuckLakeGlobalStatsInfo &stats,
+	                const std::function<optional_ptr<const LogicalType>(FieldIndex)> &get_column_type);
 };
 
 struct DuckLakeStats {

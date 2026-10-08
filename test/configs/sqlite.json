@@ -20,6 +20,12 @@
   ],
   "skip_tests": [
     {
+      "reason": "Test requires a Quack metadata catalog",
+      "paths": [
+        "test/sql/quack/inlined_superseded_drop_failure.test"
+      ]
+    },
+    {
       "reason": "Test is slow",
       "paths": [
         "test/sql/deletion_inlining/test_multiple_files_flush.test_slow"
@@ -38,24 +44,11 @@
       ]
     },
     {
-      "reason": "Failed to execute query COMMIT: database is locked",
+      "reason": "High retry counts can stall under SQLite metadata contention",
       "paths": [
-        "test/sql/compaction/compaction_delete_conflict.test",
-        "test/sql/concurrent/concurrent_insert_conflict.test",
-        "test/sql/concurrent/concurrent_insert_data_inlining.test",
-        "test/sql/rewrite_data_files/test_rewrite_concurrency.test",
-        "test/sql/rewrite_data_files/test_rewrite_transaction_conflict.test",
-        "test/sql/settings/max_retry_count.test",
-        "test/sql/snapshot_info/ducklake_current_commit.test",
-        "test/sql/snapshot_info/ducklake_last_commit.test",
-        "test/sql/stats/global_stats_transactions.test",
-        "test/sql/transaction/concurrent_table_creation.test",
-        "test/sql/transaction/transaction_conflict_cleanup.test",
-        "test/sql/transaction/transaction_conflicts.test",
-        "test/sql/transaction/transaction_conflicts_delete.test",
-        "test/sql/transaction/transaction_conflicts_view.test",
-        "test/sql/concurrent/file_level_conflict.test",
-        "test/sql/transaction/transaction_conflict_inlining.test"
+        "test/sql/issues/issue_1248_concurrent_commit_schema_id.test",
+        "test/sql/retry/commit_failure.test",
+        "test/sql/settings/max_retry_count.test"
       ]
     },
     {
@@ -73,7 +66,8 @@
         "test/sql/issues/corrupted_catalog_fault_isolation.test",
         "test/sql/secrets/ducklake_secrets.test",
         "test/sql/secrets/ducklake_secret_storages.test",
-        "test/sql/remove_orphans/metadata_in_data_path.test"
+        "test/sql/remove_orphans/metadata_in_data_path.test",
+        "test/sql/rewrite_data_files/test_rewrite_many_non_candidate_files.test"
       ]
     },
     {
@@ -101,7 +95,10 @@
       "paths": [
         "test/sql/metadata/ducklake_settings_postgres.test",
         "test/sql/metadata/metadata_schema_scoped_attach.test",
-        "test/sql/data_inlining/postgres_identifier_limit.test"
+        "test/sql/data_inlining/postgres_identifier_limit.test",
+        "test/sql/benchmark/postgres_catalog.test",
+        "test/sql/issues/issue_843_postgres_legacy_inlined_types.test",
+        "test/sql/data_inlining/inlined_superseded_drop_failure_postgres.test"
       ]
     },
     {
@@ -128,6 +125,12 @@
       "reason": "FIXME: 3-writer concurrent delete-retry test is nondeterministic under sqlite single-writer locking with current duckdb main; failed deletes error loudly (\"database is locked\", swallowed by statement maybe) so rows legitimately remain - no silent loss.",
       "paths": [
         "test/sql/deletion_inlining/test_deletion_inlining_concurrent_retry.test"
+      ]
+    },
+    {
+      "reason": "The concurrent INSERT commit fails with \"database is locked\" while the reader transaction is open, which skip_error_messages turns into a silent skip; the partial-file scenario needs a catalog that does not pin reads (quack)",
+      "paths": [
+        "test/sql/quack/partial_file_count.test"
       ]
     }
   ]

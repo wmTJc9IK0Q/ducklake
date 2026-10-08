@@ -36,7 +36,6 @@ public:
 	                                                MultiFilePushdownInfo &info,
 	                                                vector<unique_ptr<Expression>> &filters) const override;
 
-	vector<OpenFileInfo> GetAllFiles() const override;
 	FileExpandResult GetExpandResult() const override;
 	idx_t GetTotalFileCount() const override;
 	unique_ptr<NodeStatistics> GetCardinality(ClientContext &context) const override;
@@ -55,6 +54,8 @@ public:
 	bool CanUseGlobalStats() const;
 	bool IsDeleteScan() const;
 	const DuckLakeDeleteScanEntry &GetDeleteScanEntry(idx_t file_idx);
+	static DuckLakeFileData GetDeleteData(const DuckLakeDataFile &file);
+	static DuckLakeFileData GetDeleteData(const DuckLakeDeleteFile &delete_file);
 
 protected:
 	//! Get the i-th expanded file
@@ -64,8 +65,45 @@ private:
 	void GetFilesForTable() const;
 	void GetTableInsertions() const;
 	void GetTableDeletions() const;
+	void AddInlinedDataTables(DuckLakeTransaction &transaction) const;
 	void AddFilterToPushdownInfo(FilterPushdownInfo &pushdown_info, const ColumnIndex &column_index,
 	                             unique_ptr<TableFilter> filter) const;
+	//! Build the node for a table filter on one column - a leaf, or a conjunction of them when it
+	//! constrains several nested fields. nullptr for virtual columns and subjects that have no stats.
+	unique_ptr<DuckLakeFilterNode> GetFilterNode(const ColumnIndex &column_index, unique_ptr<TableFilter> filter) const;
+	//! Build the node for a filter expression reading one table column, possibly several of its fields
+	unique_ptr<DuckLakeFilterNode> GetColumnFilterNode(column_t column_id, const Expression &expr,
+	                                                   const LogicalType &column_type) const;
+	//! Record the leaves of a node as single-column filters
+	void AddFilterNodeToPushdownInfo(FilterPushdownInfo &pushdown_info, DuckLakeFilterNode &node) const;
+	//! Build a leaf node directly from an expression that constrains a single column
+	unique_ptr<DuckLakeFilterNode> GetExpressionFilterNode(MultiFilePushdownInfo &info, const Expression &expr) const;
+	//! Resolve the field a filter subject reads, descending into nested fields
+	optional_ptr<const DuckLakeFieldId> ResolveFilterField(const Expression &subject, column_t column_id) const;
+	//! Reduce an expression to per-column filters using the FilterCombiner
+	unique_ptr<DuckLakeFilterNode> CombineFilterNode(ClientContext &context, MultiFilePushdownInfo &info,
+	                                                 const Expression &expr) const;
+	//! Budgets for building one filter tree
+	struct FilterTreeState {
+		//! Bounds how much of the expression we walk - every step runs a FilterCombiner over it
+		static constexpr idx_t MAX_VISITED_NODES = 64;
+		//! Bounds what the generated query costs: one stats condition per leaf, all nested in one OR/AND
+		//! chain. Separate from the walk, since one visit can yield a leaf per column. The leaves share
+		//! the column's stats join, but planning the chain still grows superlinearly in its size.
+		static constexpr idx_t MAX_LEAVES = 64;
+
+		idx_t visited_nodes = 0;
+		idx_t leaves = 0;
+		//! Set when a budget runs out - the tree is then dropped rather than kept half-built
+		bool exhausted = false;
+
+		bool VisitNode();
+		bool AddLeaves(const DuckLakeFilterNode &node);
+	};
+	//! Build a filter tree, or nullptr if nothing in the expression can be evaluated against column stats.
+	//! A tree is not a promise that it prunes - that is decided when the SQL is generated.
+	unique_ptr<DuckLakeFilterNode> BuildFilterTree(ClientContext &context, MultiFilePushdownInfo &info,
+	                                               const Expression &expr, FilterTreeState &state) const;
 	//! Get the row_id_start for transaction-local inlined data.
 	idx_t GetTransactionLocalRowIdStart(idx_t transaction_row_start) const;
 

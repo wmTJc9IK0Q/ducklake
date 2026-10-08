@@ -60,11 +60,7 @@ static void HandleDuckLakeOption(DuckLakeOptions &options, const string &option,
 	} else if (lcase == "busy_timeout") {
 		options.busy_timeout = UBigIntValue::Get(value.DefaultCastAs(LogicalType::UBIGINT));
 	} else if (lcase == "ducklake_version") {
-		auto version = DuckLakeVersionFromString(value.ToString());
-		if (version < DuckLakeVersion::V1_0) {
-			throw InvalidInputException("ducklake_version must be >= '1.0', got '%s'", value.ToString());
-		}
-		options.ducklake_version = version;
+		options.ducklake_version = ParseWritableDuckLakeVersion(value.ToString(), "ducklake_version");
 	} else {
 		throw NotImplementedException("Unsupported option %s for DuckLake", option);
 	}
@@ -86,26 +82,29 @@ static unique_ptr<Catalog> DuckLakeAttach(optional_ptr<StorageExtensionInfo> sto
 			    "	- Or reattach using a named secret (e.g `ATTACH 'ducklake:my_named_secret' AS my_ducklake;`),\n"
 			    "For more information, see https://ducklake.select/docs/stable/duckdb/usage/connecting#secrets");
 		}
-	} else if (DuckLakeSecret::PathIsSecret(info.path)) {
-		// if the path is a plain name - load the secret name
+	} else {
+		// Secret names can be quoted identifiers, so first try an exact lookup before treating path-like names as
+		// paths.
 		secret = DuckLakeSecret::GetSecret(context, info.path);
 		if (!secret) {
-			throw InvalidInputException(
-			    "Secret \"%s\" was not found - if this was meant to be a path to a DuckDB file, use duckdb:%s instead",
-			    info.path, info.path);
+			if (DuckLakeSecret::PathIsSecret(info.path)) {
+				throw InvalidInputException("Secret \"%s\" was not found - if this was meant to be a path to a DuckDB "
+				                            "file, use duckdb:%s instead",
+				                            info.path, info.path);
+			}
+			// otherwise set the remainder of the path as the metadata path
+			options.metadata_path = info.path;
 		}
-	} else {
-		// otherwise set the remainder of the path as the metadata path
-		options.metadata_path = info.path;
 	}
 	if (secret) {
 		// if we have a secret - handle the options
-		const auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*secret->secret);
+		auto &kv_secret = secret->secret->Cast<KeyValueSecret>();
 		for (auto &entry : kv_secret.secret_map) {
 			HandleDuckLakeOption(options, entry.first.GetIdentifierName(), entry.second);
 		}
 	}
 	options.access_mode = attach_options.access_mode;
+	options.on_conflict = info.on_conflict;
 	bool is_create_if_not_exists_set = false;
 	for (auto &entry : attach_options.options) {
 		if (StringUtil::Lower(entry.first) == "create_if_not_exists") {
