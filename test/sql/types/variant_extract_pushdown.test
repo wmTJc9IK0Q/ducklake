@@ -78,3 +78,35 @@ query I
 SELECT count(*) FROM (SELECT v.k::VARCHAR AS k FROM t OFFSET 0) WHERE k = 'v2'
 ----
 100
+
+# A VARIANT column added after a file was written is missing from that file, so the
+# file reads it as its NULL default. With the extract pushed into the scan the slot
+# holds the extracted field, not the column, and the default has to have the field's
+# type for filters on the field to be evaluated against it.
+statement ok
+CREATE TABLE late(id INTEGER)
+
+statement ok
+INSERT INTO late VALUES (1)
+
+statement ok
+ALTER TABLE late ADD COLUMN v VARIANT
+
+statement ok
+INSERT INTO late VALUES (2, {'a': 42}::VARIANT), (3, NULL)
+
+query I
+SELECT count(*) FROM late WHERE v.a::INTEGER = 42
+----
+1
+
+query II
+SELECT id, v.a::INTEGER FROM late WHERE v.a::INTEGER = 42 OR id = 1 ORDER BY id
+----
+1	NULL
+2	42
+
+query I
+SELECT count(*) FROM late WHERE v.a IS NULL
+----
+2

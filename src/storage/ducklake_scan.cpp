@@ -114,10 +114,15 @@ unique_ptr<BaseStatistics> DuckLakeStatistics(ClientContext &context, const Func
 //! flat index into the inlined chunk and has no way to express a path, so it would emit the parent value into a
 //! slot the plan has already narrowed - wrong rows, silently, with no error to notice. Decline the pushdown for
 //! any scan that can reach inlined rows and let the ordinary extract run above the scan instead.
+//!
+//! STRUCT columns are declined too. DuckLake evolves structs by field id, so a file can lack a field the table
+//! has. Extracting that field yields its default as a per-file constant, which is wrong for the rows whose struct
+//! is NULL (the field must then be NULL), and filters on it get evaluated against that constant. Without the
+//! extract the whole struct is remapped, which handles both; DuckLake prunes struct fields by their own stats.
 static bool DuckLakeSupportsPushdownExtract(const FunctionData &bind_data_p, const LogicalIndex &col_idx) {
 	auto &bind_data = bind_data_p.Cast<MultiFileBindData>();
 	auto &column_type = bind_data.columns[col_idx.index].type;
-	if (column_type.id() != LogicalTypeId::STRUCT && column_type.id() != LogicalTypeId::VARIANT) {
+	if (column_type.id() != LogicalTypeId::VARIANT) {
 		return false;
 	}
 	auto &file_list = bind_data.file_list->Cast<DuckLakeMultiFileList>();
