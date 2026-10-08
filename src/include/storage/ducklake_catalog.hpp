@@ -37,26 +37,17 @@ struct DuckLakeSnapshotCommit;
 struct DeleteFileMap;
 class LogicalGet;
 
-//! Every table's global statistics as of one (schema version, data generation) pair.
-//!
-//! Held as a whole catalog snapshot rather than one entry per table. The cache key already
-//! embeds a catalog-wide generation counter, so per-table entries were only ever invalidated
-//! together and the finer granularity bought nothing; and a single round trip can read the
-//! statistics of every table, so loading them together is also cheaper than loading them one
-//! at a time.
-//!
-//! Absence of a table from `table_stats` is itself a cached fact: it records that the table
-//! had no statistics row at this generation. Without that, a catalog in which most tables
-//! carry no statistics - the normal state for tables that have only ever been written through
-//! a path that does not maintain them - re-runs a metadata query for every one of them on
-//! every plan, which is the case this cache most needs to cover.
-struct DuckLakeGlobalStatsCacheEntry : public ObjectCacheEntry {
+//! Per-table stats cache entry, keyed by <next_file_id, table_id>.
+struct DuckLakeTableStatsCacheEntry : public ObjectCacheEntry {
 	static constexpr idx_t ESTIMATED_BYTES_PER_COLUMN_STATS = 256;
 
-	unordered_map<idx_t, shared_ptr<DuckLakeTableStats>> table_stats;
+	explicit DuckLakeTableStatsCacheEntry(DuckLakeTableStats stats_p) : stats(std::move(stats_p)) {
+	}
+
+	DuckLakeTableStats stats;
 
 	static string ObjectType() {
-		return "ducklake_global_stats";
+		return "ducklake_table_stats";
 	}
 	string GetObjectType() override {
 		return ObjectType();
@@ -310,8 +301,8 @@ public:
 	//! once when the schema version is created and never updated, so the mapping is permanent.
 	void CacheSchemaVersionBeginSnapshot(TableIndex table_id, idx_t schema_version, idx_t begin_snapshot);
 
-	//! Invalidate the cached statistics of every table at a given (schema version, data generation).
-	void InvalidateGlobalStatsCache(idx_t schema_version, idx_t next_file_id);
+	//! Invalidate the cached table stats entry for a given stats cache key.
+	void InvalidateTableStatsCache(idx_t next_file_id, TableIndex table_id);
 	//! Invalidate the cached schema entry for a given schema_version.
 	void InvalidateSchemaCache(idx_t schema_version);
 	//! Invalidate a cached name map for a deleted mapping ID.
@@ -326,10 +317,7 @@ private:
 	//! Pin a schema cache entry for the duration of the current query to ensure safe memory access.
 	void PinSchemaForQuery(DuckLakeTransaction &transaction, shared_ptr<DuckLakeSchemaCacheEntry> entry);
 	void LoadNameMaps(DuckLakeTransaction &transaction);
-	//! Look up (or load) the statistics of every table at the snapshot's generation.
-	shared_ptr<DuckLakeGlobalStatsCacheEntry> GetGlobalStats(DuckLakeTransaction &transaction,
-	                                                         DuckLakeSnapshot snapshot);
-	string StatsCacheKey(idx_t schema_version, idx_t next_file_id) const;
+	string StatsCacheKey(idx_t next_file_id, TableIndex table_id) const;
 	string SchemaCacheKey(idx_t schema_version) const;
 	string SchemaPinStateKey() const;
 	ObjectCache &GetObjectCacheInstance();
