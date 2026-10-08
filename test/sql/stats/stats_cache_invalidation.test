@@ -49,22 +49,19 @@ SELECT count(*) FROM ducklake.t WHERE id >= 999000
 statement ok
 CREATE TABLE ducklake.u AS SELECT i AS id FROM range(1000) t(i);
 
-statement ok con_reader
-ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS lake_r (DATA_PATH '{DATA_PATH}/stats_cache_invalidation')
-
-statement ok con_writer
-ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS lake_w (DATA_PATH '{DATA_PATH}/stats_cache_invalidation')
-
+# A second connection's commit has to invalidate what the first one cached. DuckDB
+# refuses to attach the same metadata file twice in one instance, so both connections
+# share the one attach.
 query I con_reader
-SELECT count(*) FROM lake_r.u WHERE id >= 9000
+SELECT count(*) FROM ducklake.u WHERE id >= 9000
 ----
 0
 
 statement ok con_writer
-INSERT INTO lake_w.u SELECT i AS id FROM range(9000, 9042) t(i);
+INSERT INTO ducklake.u SELECT i AS id FROM range(9000, 9042) t(i);
 
 query I con_reader
-SELECT count(*) FROM lake_r.u WHERE id >= 9000
+SELECT count(*) FROM ducklake.u WHERE id >= 9000
 ----
 42
 
